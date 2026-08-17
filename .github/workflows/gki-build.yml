@@ -1,0 +1,503 @@
+# .github/workflows/gki-build.yml
+#
+# Builds ONE GKI kernel (one KMI) with the chosen root solution + SUSFS,
+# renames it with your own branding, and uploads an AnyKernel3 zip.
+#
+# Callable on its own (workflow_dispatch) or from build-all-gki.yml (workflow_call).
+#
+# Verified while writing this file:
+#   - AOSP manifest branches   common-<android>-<kver>-<patchlevel>   exist
+#   - susfs4ksu branches       gki-android12-5.10 / gki-android13-5.10 / gki-android13-5.15 /
+#                              gki-android14-5.15 / gki-android14-6.1 / gki-android15-6.6 /
+#                              gki-android16-6.12
+#   - setup.sh reachable for ReSukiSU, SukiSU-Ultra and KernelSU-Next
+#   - CONFIG_KPM exists ONLY in SukiSU-Ultra. ReSukiSU and KernelSU-Next do not have it.
+#   - CONFIG_KSU_SUSFS* are built into ReSukiSU itself.
+
+name: GKI build
+
+on:
+  workflow_dispatch:
+    inputs:
+      android_version: { description: "android12 / android13 / android14 / android15 / android16", required: true, default: "android13" }
+      kernel_version:  { description: "5.10 / 5.15 / 6.1 / 6.6 / 6.12", required: true, default: "5.10" }
+      sub_level:       { description: "sub level, e.g. 223", required: true, default: "223" }
+      os_patch_level:  { description: "manifest date, e.g. 2024-11 or lts", required: true, default: "2024-11" }
+      root_solution:
+        description: "root solution"
+        required: true
+        default: "ReSukiSU"
+        type: choice
+        options: [ReSukiSU, SukiSU-Ultra, KernelSU-Next]
+      ksu_branch:      { description: "branch/tag passed to setup.sh (blank = default)", required: false, default: "" }
+      add_susfs:       { description: "apply SUSFS", type: boolean, default: true }
+      add_kpm:         { description: "CONFIG_KPM (SukiSU-Ultra only)", type: boolean, default: false }
+      kernel_name:     { description: "kernel name template", required: false, default: "{base}-evokerr" }
+      builder:         { description: "builder shown in Settings", required: false, default: "evokerr@evokeroot" }
+      link:            { description: "link shown in /proc/version and uname -v", required: false, default: "t.me/evokeroot" }
+
+  workflow_call:
+    inputs:
+      android_version: { type: string, required: true }
+      kernel_version:  { type: string, required: true }
+      sub_level:       { type: string, required: true }
+      os_patch_level:  { type: string, required: true }
+      root_solution:   { type: string, required: true }
+      ksu_branch:      { type: string, required: false, default: "" }
+      add_susfs:       { type: boolean, required: false, default: true }
+      add_kpm:         { type: boolean, required: false, default: false }
+      kernel_name:     { type: string, required: false, default: "{base}-evokerr" }
+      builder:         { type: string, required: false, default: "evokerr@evokeroot" }
+      link:            { type: string, required: false, default: "t.me/evokeroot" }
+      release_tag:
+        description: "upload straight to this release instead of leaving an artifact"
+        type: string
+        required: false
+        default: ""
+      months:
+        description: "comma-separated months to try, newest first (blank = just os_patch_level)"
+        type: string
+        required: false
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      ANDROID_VER: ${{ inputs.android_version }}
+      KERNEL_VER:  ${{ inputs.kernel_version }}
+      SUB_LEVEL:   ${{ inputs.sub_level }}
+      PATCH_LEVEL: ${{ inputs.os_patch_level }}
+      ROOT_SOL:    ${{ inputs.root_solution }}
+
+    steps:
+      - name: Checkout (for scripts/brand_kernel.py)
+        uses: actions/checkout@v4
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          df -h /
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            git curl wget bc bison flex libssl-dev libelf-dev python3 python3-pip \
+            build-essential ccache zip unzip rsync cpio lz4 zstd
+          mkdir -p "$HOME/bin"
+          curl -sSL https://storage.googleapis.com/git-repo-downloads/repo -o "$HOME/bin/repo"
+          chmod a+x "$HOME/bin/repo"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          git config --global user.name  "kernel-builder"
+          git config --global user.email "builder@localhost"
+
+      # A wrong os_patch_level otherwise burns ~15 minutes of sync before failing with a
+      # confusing repo error. Check the branch first and say exactly what is available.
+      - name: Pre-flight - does the manifest branch exist
+        run: |
+          set -eu
+          BRANCH="common-${ANDROID_VER}-${KERNEL_VER}-${PATCH_LEVEL}"
+          echo "Looking for $BRANCH ..."
+          if curl -sfo /dev/null "https://android.googlesource.com/kernel/manifest/+refs/heads/${BRANCH}?format=JSON"; then
+            echo "OK: $BRANCH exists."
+          else
+            echo "::error::manifest branch '$BRANCH' does not exist."
+            echo "Available os_patch_level values for ${ANDROID_VER}-${KERNEL_VER}:"
+            curl -s "https://android.googlesource.com/kernel/manifest/+refs/heads/?format=JSON" \
+              | tail -c +6 \
+              | grep -o "common-${ANDROID_VER}-${KERNEL_VER}-[0-9-]*" \
+              | sort -u | sed 's/.*-\([0-9]\{4\}-[0-9]\{2\}\)$/  \1/'
+            exit 1
+          fi
+
+      # A susfs patch is written against whatever sublevel susfs happened to track, while
+      # Google publishes a new monthly GKI branch every few weeks, so the two drift apart.
+      # Neither side alone is enough to close the gap:
+      #
+      #   * walking only the kernel month costs a full repo sync per attempt (30+ minutes
+      #     on android16-6.12) and ships an older kernel than necessary
+      #   * walking only susfs history finds nothing at all on android13-5.15 and
+      #     android16-6.12 at their newest month
+      #
+      # So both, newest first, with the cheap loop on the inside: one sync per month, then
+      # up to 60 instant susfs dry-runs against it. The first exact fit wins, and the pair
+      # that was used is printed and carried into the artifact name.
+      - name: Sync a kernel and susfs pair that fit exactly
+        run: |
+          set -eu
+          WANT_SUSFS="${{ inputs.add_susfs }}"
+          P="kernel_patches/50_add_susfs_in_gki-${ANDROID_VER}-${KERNEL_VER}.patch"
+
+          if [ "$WANT_SUSFS" = "true" ]; then
+            git clone -q https://gitlab.com/simonpunk/susfs4ksu.git \
+              -b "gki-${ANDROID_VER}-${KERNEL_VER}" susfs4ksu
+            REVS="$(git -C susfs4ksu rev-list --max-count=60 HEAD)"
+
+            # A standalone shallow clone of the driver, only so the compatibility check
+            # below can read its sources. setup.sh does the real thing later, inside the
+            # kernel tree, and this copy is thrown away.
+            case "$ROOT_SOL" in
+              ReSukiSU)      DRV_URL="https://github.com/ReSukiSU/ReSukiSU";           DRV_BR="main" ;;
+              SukiSU-Ultra)  DRV_URL="https://github.com/SukiSU-Ultra/SukiSU-Ultra";   DRV_BR="builtin" ;;
+              KernelSU-Next) DRV_URL="https://github.com/pershoot/KernelSU-Next";      DRV_BR="next-susfs" ;;
+            esac
+            [ -n "${{ inputs.ksu_branch }}" ] && DRV_BR="${{ inputs.ksu_branch }}"
+            git clone -q --depth=1 -b "$DRV_BR" "$DRV_URL" drvsrc
+          fi
+
+          # Months that carry the same sublevel are interchangeable, and the caller passes
+          # them newest first. Naming is by sublevel, so whichever one works produces the
+          # same filename and two jobs can never overwrite each other.
+          MONTHS="$(echo "${{ inputs.months }}" | tr ',' ' ')"
+          [ -n "$MONTHS" ] || MONTHS="$PATCH_LEVEL"
+          echo "months to try: $MONTHS"
+
+          mkdir -p kernel
+          for M in $MONTHS; do
+            echo "::group::syncing common-${ANDROID_VER}-${KERNEL_VER}-${M}"
+            cd "$GITHUB_WORKSPACE/kernel"
+            # re-init in place: repo reuses the objects it already has, so the second and
+            # later months sync far faster than the first
+            #
+            # --groups matters. On android16-6.12 the manifest carries
+            #   <project path="prebuilts/rust" groups="ddk" />
+            # and a default sync skips non-default groups, so rustc never arrives,
+            # CONFIG_RUST stays off, and the build dies at the end with
+            #   Unable to find drivers/android/binder/rust_binder.ko
+            # because kleaf's module list still expects it. On android15-6.6 the same
+            # project has no groups attribute, which is why 6.6 built and 6.12 did not.
+            # Older branches simply have no ddk group and ignore this.
+            repo init -q --depth=1 -u https://android.googlesource.com/kernel/manifest \
+              -b "common-${ANDROID_VER}-${KERNEL_VER}-${M}" \
+              --groups=default,ddk,ddk-external
+            repo sync -q -c -j"$(nproc)" --no-tags --no-clone-bundle --force-sync
+            echo "::endgroup::"
+
+            # The real sublevel comes from the tree we just synced, not from the input.
+            # The caller only has a cached guess, and a stale or failed lookup there was
+            # producing artifacts named 5.15.0 and 6.6.0.
+            REAL_SUB="$(sed -n 's/^SUBLEVEL[[:space:]]*=[[:space:]]*\([0-9]\+\).*/\1/p' common/Makefile | head -1)"
+            [ -n "$REAL_SUB" ] && echo "SUB_LEVEL=$REAL_SUB" >> "$GITHUB_ENV"
+            echo "sublevel from the tree: ${REAL_SUB:-unknown} (input said ${SUB_LEVEL})"
+
+            if [ "$WANT_SUSFS" != "true" ]; then
+              echo "PATCH_LEVEL=$M"     >> "$GITHUB_ENV"
+              echo "KERNEL_ROOT=$PWD"   >> "$GITHUB_ENV"
+              exit 0
+            fi
+
+            for C in $REVS; do
+              git -C "$GITHUB_WORKSPACE/susfs4ksu" checkout -q "$C"
+              [ -f "$GITHUB_WORKSPACE/susfs4ksu/$P" ] || continue
+
+              # KernelSU-Next only. ReSukiSU and SukiSU-Ultra carry their own SUSFS
+              # implementation inside the driver, so their sources contain calls in the
+              # older style even while they build fine against the newest susfs headers.
+              # Running this check on them rejected every single revision and failed all
+              # 31 builds in a run - the check is about pershoot's fork, which consumes
+              # the kernel-side API rather than shipping its own.
+              #
+              # Two ways that went wrong there, both found 20 minutes into a compile:
+              #   * on 5.10 the driver calls susfs_set_uname(struct st_susfs_uname *)
+              #     while susfs >= 2025-11 declares void susfs_set_uname(void **)
+              #   * on 6.6 the driver uses CMD_SUSFS_ADD_SUS_MAP and
+              #     CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING, which older susfs never defined
+              # A fixed date pin cannot satisfy both, because susfs's gki-android14-6.1
+              # branch runs ahead of gki-android13-5.10.
+              if [ "$ROOT_SOL" = "KernelSU-Next" ]; then
+                HDR="$GITHUB_WORKSPACE/susfs4ksu/kernel_patches/include/linux/susfs.h"
+                [ -f "$HDR" ] || continue
+                BAD=0
+                for CMD in $(grep -rhos 'CMD_SUSFS_[A-Z0-9_]*' \
+                               "$GITHUB_WORKSPACE/drvsrc/kernel" 2>/dev/null | sort -u); do
+                  grep -q "define[[:space:]]\+$CMD\b" "$HDR" || { BAD=1; break; }
+                done
+                [ "$BAD" = 0 ] || continue
+                if grep -rqs 'susfs_set_uname((struct' "$GITHUB_WORKSPACE/drvsrc/kernel" \
+                   && grep -qs 'void susfs_set_uname(void __user' "$HDR"; then
+                  continue  # driver wants the int/typed form, this susfs has the void form
+                fi
+              fi
+
+              # -F0: no fuzz. Fuzz places a hunk where the context only roughly matches,
+              # and on android16-6.12 that produced syntactically broken C in
+              # fs/proc/task_mmu.c which surfaced 15 minutes later in the compile.
+              if (cd common && patch -p1 -F0 --dry-run --no-backup-if-mismatch \
+                    < "$GITHUB_WORKSPACE/susfs4ksu/$P" >/dev/null 2>&1); then
+                D="$(git -C "$GITHUB_WORKSPACE/susfs4ksu" log -1 --format=%cd --date=short)"
+                echo "match: kernel $M  +  susfs ${C} ($D)"
+                echo "PATCH_LEVEL=$M"   >> "$GITHUB_ENV"
+                echo "KERNEL_ROOT=$PWD" >> "$GITHUB_ENV"
+                echo "SUSFS_REV=$C"     >> "$GITHUB_ENV"
+                exit 0
+              fi
+            done
+            echo "no susfs revision fits $M, stepping back a month"
+          done
+
+          echo "::error::no (kernel month, susfs revision) pair fits ${ANDROID_VER}-${KERNEL_VER}."
+          echo "tried months: $MONTHS"
+          exit 1
+
+      - name: Add the root solution
+        working-directory: kernel
+        run: |
+          set -eux
+          # Which branch actually carries SUSFS was checked by reading kernel/Kconfig on
+          # every branch of each repo (2026-08-17):
+          #   ReSukiSU       ReSukiSU/ReSukiSU        main        12 symbols -> KernelSU/
+          #   SukiSU-Ultra   SukiSU-Ultra/SukiSU-Ultra builtin    10 symbols -> KernelSU/
+          #   KernelSU-Next  pershoot/KernelSU-Next   next-susfs  15 symbols -> KernelSU-Next/
+          #
+          # KernelSU-Next comes from pershoot's fork on purpose: the upstream
+          # KernelSU-Next repo defines no CONFIG_KSU_SUSFS on any branch, so a build from
+          # there silently ends up with no SUSFS. pershoot/next-susfs is the fork that
+          # carries the integration, and it is what other GKI builders use as well.
+          #
+          # "susfs-main" and upstream "next-susfs" do not exist. Handing setup.sh a
+          # missing branch does not fail - it quietly leaves you on the default one, which
+          # is how the first SukiSU-Ultra build came out with no SUSFS while every step
+          # reported success.
+          case "$ROOT_SOL" in
+            ReSukiSU)
+              URL="https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh"
+              DEF_BRANCH="main"; KSU_DIR="KernelSU" ;;
+            SukiSU-Ultra)
+              URL="https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh"
+              DEF_BRANCH="builtin"; KSU_DIR="KernelSU" ;;
+            KernelSU-Next)
+              URL="https://raw.githubusercontent.com/pershoot/KernelSU-Next/next-susfs/kernel/setup.sh"
+              DEF_BRANCH="next-susfs"; KSU_DIR="KernelSU-Next" ;;
+            *) echo "unknown root solution: $ROOT_SOL"; exit 1 ;;
+          esac
+          BR="${{ inputs.ksu_branch }}"
+          [ -n "$BR" ] || BR="$DEF_BRANCH"
+          curl -LSs "$URL" | bash -s "$BR"
+
+          test -d "$KSU_DIR" || { echo "::error::$KSU_DIR was not created"; exit 1; }
+
+          # refuse the silent fallback described above
+          GOT="$(git -C "$KSU_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+          echo "asked for '$BR', got '$GOT'"
+          if [ "$GOT" != "$BR" ] && [ "$GOT" != "HEAD" ]; then
+            echo "::error::setup.sh landed on '$GOT' instead of '$BR'. The branch was probably renamed upstream."
+            exit 1
+          fi
+          echo "KSU_DIR=$KSU_DIR" >> "$GITHUB_ENV"
+
+      - name: Apply SUSFS
+        if: inputs.add_susfs
+        working-directory: kernel
+        run: |
+          set -eux
+          # susfs4ksu is already cloned and checked out at $SUSFS_REV by the step above.
+          ln -sfn "$GITHUB_WORKSPACE/susfs4ksu" susfs4ksu
+          cp susfs4ksu/kernel_patches/fs/* common/fs/
+          cp susfs4ksu/kernel_patches/include/linux/* common/include/linux/
+          cd common
+          P="../susfs4ksu/kernel_patches/50_add_susfs_in_gki-${ANDROID_VER}-${KERNEL_VER}.patch"
+          # -F0 to match the dry-run in the sync step. The month was already chosen because
+          # the patch fits exactly there, so anything less than a clean apply is a bug on
+          # our side and should stop the build rather than produce a kernel nobody checked.
+          if patch -p1 -F0 --no-backup-if-mismatch < "$P"; then
+            echo "susfs patch applied cleanly"
+          else
+            echo "::error::susfs patch failed at ${PATCH_LEVEL} even though the dry-run passed."
+            for r in $(find . -name '*.rej'); do echo "--- rejected: $r ---"; cat "$r"; done
+            exit 1
+          fi
+          # Only the fs/ side is patched here, never the driver.
+          #
+          # susfs4ksu also ships KernelSU/10_enable_susfs_for_ksu.patch, but that targets
+          # upstream KernelSU's source layout. All three forks we build have diverged from
+          # it, and `patch -F3` is happy to apply the hunks in the wrong place: the result
+          # compiles calls to ksu_late_loaded() and ksu_lsm_hook_exit(), which do not exist
+          # in these forks, and the build dies in drivers/kernelsu/core/init.c.
+          #
+          # Each fork brings its own SUSFS glue on the branch setup.sh checks out, so the
+          # patch is not just risky, it is redundant. Do not add it back.
+
+      # The options go straight into gki_defconfig rather than through
+      # GKI_DEFCONFIG_FRAGMENT. build.sh *sources* that variable as shell, which turns
+      # every line into an exported environment variable - CONFIG_KSU=y then reaches make
+      # during `mrproper`, where CONFIG_ARM64 is not set yet, and ReSukiSU's Kbuild aborts
+      # with "only support arm64-v8a, armeabi-v7a, x86-64".
+      - name: Add the options to gki_defconfig
+        working-directory: kernel
+        run: |
+          set -eux
+          FRAG="$(mktemp)"
+          {
+            echo "CONFIG_KSU=y"
+            # No CONFIG_KSU_MANUAL_HOOK here. It is optional - each driver picks a hook
+            # method on its own - and on 6.12 it silently resolves to empty, which kleaf
+            # treats as a hard error because every fragment line must take effect.
+            echo "CONFIG_TMPFS_XATTR=y"
+            echo "CONFIG_TMPFS_POSIX_ACL=y"
+          } > "$FRAG"
+
+          if [ "${{ inputs.add_susfs }}" = "true" ]; then
+            {
+              echo "CONFIG_KSU_SUSFS=y"
+              echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
+              echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
+              echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"
+              echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y"
+              echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
+              echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"
+              echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y"
+              echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y"
+              echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"
+              # No "=n" lines here. kleaf checks that every fragment line took effect, and
+              # a bool set to n leaves no line in the resulting config at all, so kleaf
+              # reports  actual '' , expected 'CONFIG_..._SUS_SU=n'  and stops. Anything
+              # we want off is off by default anyway.
+            } >> "$FRAG"
+          fi
+
+          # KPM only exists in SukiSU-Ultra's Kconfig. Setting it anywhere else is a no-op
+          # that silently does nothing, so refuse loudly instead.
+          if [ "${{ inputs.add_kpm }}" = "true" ]; then
+            if [ "$ROOT_SOL" != "SukiSU-Ultra" ]; then
+              echo "ERROR: CONFIG_KPM only exists in SukiSU-Ultra, not in $ROOT_SOL."
+              exit 1
+            fi
+            echo "CONFIG_KPM=y" >> "$FRAG"
+          fi
+
+          # drop symbols the chosen driver does not define, so the build does not warn
+          for sym in $(grep -o '^CONFIG_[A-Z0-9_]*' "$FRAG"); do
+            name="${sym#CONFIG_}"
+            if ! grep -rq "config $name\b" "$KSU_DIR" common/fs 2>/dev/null; then
+              case "$name" in
+                TMPFS_XATTR|TMPFS_POSIX_ACL) : ;;   # kernel's own symbols
+                *) echo "  dropping unsupported $sym"; sed -i "/^${sym}=/d" "$FRAG" ;;
+              esac
+            fi
+          done
+
+          # kleaf (6.1+) verifies gki_defconfig against savedefconfig inside bazel, where
+          # the build.config.gki edit below cannot reach it - that is what broke
+          # android16-6.12 while the 5.10 builds were fine. So: touch gki_defconfig only
+          # on the build.sh path, and hand kleaf a real defconfig fragment instead.
+          cp "$FRAG" common/arch/arm64/configs/evokerr.fragment
+
+          if [ -f build/build.sh ]; then
+            DEFCONFIG="common/arch/arm64/configs/gki_defconfig"
+            # replace rather than append, so a re-run does not stack duplicates
+            while read -r line; do
+              [ -n "$line" ] || continue
+              key="${line%%=*}"
+              sed -i "/^${key}=/d;/^# ${key} is not set/d" "$DEFCONFIG"
+              echo "$line" >> "$DEFCONFIG"
+            done < "$FRAG"
+          else
+            DEFCONFIG="common/arch/arm64/configs/evokerr.fragment"
+            echo "kleaf build: gki_defconfig left untouched, fragment passed to bazel"
+          fi
+
+          # build.config.gki runs check_defconfig as a POST_DEFCONFIG_CMD. It re-runs
+          # savedefconfig and demands the result match gki_defconfig byte for byte, which
+          # no added option can ever satisfy - savedefconfig reorders and folds implied
+          # symbols. Every GKI builder drops that check; so do we.
+          for f in common/build.config.gki common/build.config.gki.aarch64 \
+                   common/build.config.gki-debug.aarch64; do
+            [ -f "$f" ] || continue
+            if grep -q "check_defconfig" "$f"; then
+              sed -i 's/check_defconfig//g' "$f"
+              echo "  dropped check_defconfig from $f"
+            fi
+          done
+
+          echo "----- added -----"; cat "$FRAG"
+          echo "----- tail of gki_defconfig -----"; tail -20 "$DEFCONFIG"
+
+          # Say plainly when SUSFS was asked for but the driver cannot provide it, instead
+          # of shipping a kernel that quietly has none. KernelSU-Next is in that position:
+          # no branch of it defines CONFIG_KSU_SUSFS.
+          SUFFIX=""
+          if [ "${{ inputs.add_susfs }}" = "true" ] && ! grep -q '^CONFIG_KSU_SUSFS=y' "$FRAG"; then
+            echo "::warning::SUSFS was requested but $ROOT_SOL does not define CONFIG_KSU_SUSFS on this branch. Building without it."
+            SUFFIX="-noSUSFS"
+          fi
+          echo "NAME_SUFFIX=$SUFFIX" >> "$GITHUB_ENV"
+
+      - name: Build
+        working-directory: kernel
+        run: |
+          set -eux
+          if [ -f build/build.sh ]; then
+            # 5.10 / 5.15 use the legacy build.sh.
+            # No GKI_DEFCONFIG_FRAGMENT here on purpose - the options are already inside
+            # gki_defconfig, and build.sh sources that variable as shell.
+            # No HOSTLD override: the tree ships its own LLVM under prebuilts and build.sh
+            # puts it on PATH. Pointing at /usr/bin/ld.lld only works if lld happens to be
+            # installed system-wide, and on a stock runner it is not.
+            KMI_SYMBOL_LIST_STRICT_MODE=0 \
+            LTO=thin \
+            BUILD_CONFIG=common/build.config.gki.aarch64 \
+            build/build.sh
+          else
+            # 6.1+ use kleaf / bazel. The options come in as a fragment so gki_defconfig
+            # stays canonical and kleaf's own savedefconfig check keeps passing.
+            tools/bazel build --config=fast --lto=thin \
+              --defconfig_fragment=//common:arch/arm64/configs/evokerr.fragment \
+              //common:kernel_aarch64_dist
+          fi
+
+      - name: Locate the built Image
+        working-directory: kernel
+        run: |
+          set -eux
+          for p in \
+            "out/${ANDROID_VER}-${KERNEL_VER}/dist/Image" \
+            "out/android-${KERNEL_VER}/dist/Image" \
+            "bazel-bin/common/kernel_aarch64/Image" ; do
+            if [ -f "$p" ]; then echo "IMAGE=$PWD/$p" >> "$GITHUB_ENV"; exit 0; fi
+          done
+          echo "Image not found:"; find . -name Image -type f | head -20; exit 1
+
+      - name: Rename the kernel
+        run: |
+          set -eux
+          python3 "$GITHUB_WORKSPACE/scripts/brand_kernel.py" \
+            --image   "$IMAGE" \
+            --name    '${{ inputs.kernel_name }}' \
+            --builder '${{ inputs.builder }}' \
+            --link    '${{ inputs.link }}'
+
+      - name: Package AnyKernel3
+        run: |
+          set -eux
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git
+          rm -rf AnyKernel3/.git AnyKernel3/README.md
+          sed -i "s/do.devicecheck=1/do.devicecheck=0/;s/is_slot_device=0/is_slot_device=auto/" AnyKernel3/anykernel.sh
+          sed -i "s|kernel.string=.*|kernel.string=${{ inputs.builder }} \| ${{ inputs.link }}|" AnyKernel3/anykernel.sh
+          cp "$IMAGE" AnyKernel3/Image
+          # Same shape other GKI builders use, so the KMI is readable at a glance and the
+          # repo already tells you which root solution it is.
+          NAME="${KERNEL_VER}.${SUB_LEVEL}-${ANDROID_VER}-${PATCH_LEVEL}${NAME_SUFFIX}-AnyKernel3"
+          echo "FILE_NAME=$NAME" >> "$GITHUB_ENV"
+
+      # With ~200 builds per run, collecting every AnyKernel3 tree as an artifact and
+      # zipping them at the end would move several gigabytes through one job. Each build
+      # attaches its own zip to the release instead.
+      - name: Attach to the release
+        if: inputs.release_tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eux
+          (cd AnyKernel3 && zip -qr "$GITHUB_WORKSPACE/${FILE_NAME}.zip" .)
+          gh release upload "${{ inputs.release_tag }}" "${FILE_NAME}.zip" --clobber \
+            --repo "${{ github.repository }}"
+
+      - name: Upload as an artifact
+        if: inputs.release_tag == ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.FILE_NAME }}
+          path: ./AnyKernel3/**

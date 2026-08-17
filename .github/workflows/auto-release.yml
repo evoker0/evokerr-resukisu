@@ -1,0 +1,128 @@
+name: Auto release
+
+# Builds every (monthly GKI branch, root solution) pair that is not in state.json yet,
+# and attaches each kernel to one release as it finishes.
+#
+# Two things make a pair stale:
+#   * Google publishes a new monthly branch
+#   * the root solution ships a new tag
+#
+# The first run is a backfill of every month Google still keeps alive - a few hundred
+# builds. After that a quiet week costs nothing.
+
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "all = every monthly branch, newest = only the latest per KMI"
+        type: choice
+        options: [all, newest]
+        default: all
+      limit:
+        description: "cap this run (0 = no cap). Anything skipped comes back next run."
+        default: "0"
+      force:
+        description: "ignore state.json and rebuild"
+        type: boolean
+        default: false
+      roots:
+        description: "which variants to build"
+        default: "ReSukiSU"
+
+permissions:
+  contents: write
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.check.outputs.matrix }}
+      count:  ${{ steps.check.outputs.count }}
+      tag:    ${{ steps.stamp.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: stamp
+        run: echo "tag=$(date -u +'%Y.%m.%d-%H%M')" >> "$GITHUB_OUTPUT"
+
+      - id: check
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 scripts/check_upstream.py \
+            --state state.json \
+            --mode "${{ inputs.mode || 'all' }}" \
+            --limit "${{ inputs.limit || 0 }}" \
+            --roots "${{ inputs.roots || 'ReSukiSU' }}" \
+            ${{ inputs.force && '--force' || '' }}
+
+      - name: Open the release
+        if: steps.check.outputs.count != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          {
+            echo "GKI kernels, one per monthly branch and KMI."
+            echo
+            echo "Pick the file whose kernel version and \`androidXX\` match \`uname -r\` on"
+            echo "your device. A kernel built for a different KMI generation will not boot."
+            echo
+            echo "Flash the AnyKernel3 zip from a recovery or a root manager, or put the"
+            echo "\`Image\` into your own boot image with magiskboot."
+            echo
+            echo "Files land here as each build finishes, so the list grows while the run is"
+            echo "still going. A \`-noSUSFS\` suffix means SUSFS could not be fitted for that"
+            echo "combination and the kernel was built without it."
+          } > notes.md
+          gh release create "${{ steps.stamp.outputs.tag }}" \
+            --title "${{ steps.stamp.outputs.tag }}" --notes-file notes.md \
+            --repo "${{ github.repository }}"
+
+      - name: Keep the new state
+        if: steps.check.outputs.count != '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: state
+          path: state.json
+
+  build:
+    needs: detect
+    if: needs.detect.outputs.count != '0'
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix: ${{ fromJson(needs.detect.outputs.matrix) }}
+    uses: ./.github/workflows/gki-build.yml
+    with:
+      android_version: ${{ matrix.android_version }}
+      kernel_version:  ${{ matrix.kernel_version }}
+      sub_level:       ${{ matrix.sub_level }}
+      os_patch_level:  ${{ matrix.os_patch_level }}
+      root_solution:   ${{ matrix.root_solution }}
+      add_susfs:       true
+      add_kpm:         false
+      months:          ${{ matrix.months }}
+      release_tag:     ${{ needs.detect.outputs.tag }}
+
+  record:
+    needs: [detect, build]
+    if: always() && needs.detect.outputs.count != '0'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: state
+          path: newstate
+      - name: Commit state.json
+        run: |
+          set -eu
+          cp newstate/state.json state.json
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          git diff --cached --quiet || git commit -m "state: record ${{ needs.detect.outputs.tag }}"
+          git push
