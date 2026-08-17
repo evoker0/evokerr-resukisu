@@ -1,0 +1,78 @@
+name: Build all GKI
+
+# Manual fan-out over the GKI KMIs. auto-release.yml does this on a schedule and only
+# for what changed; this one is for when you just want to rebuild something now.
+#
+# The matrix is produced by a job rather than written inline, because a job-level `if`
+# cannot read the `matrix` context - that combination makes the whole file unparseable
+# and GitHub silently falls back to showing the file path instead of the name.
+
+on:
+  workflow_dispatch:
+    inputs:
+      root_solution:
+        description: "root solution"
+        required: true
+        default: "ReSukiSU"
+        type: choice
+        options: [ReSukiSU, SukiSU-Ultra, KernelSU-Next]
+      only:
+        description: "single KMI, e.g. android13-5.10 (blank = all)"
+        required: false
+        default: ""
+      add_susfs:   { description: "apply SUSFS", type: boolean, default: true }
+      add_kpm:     { description: "CONFIG_KPM (SukiSU-Ultra only)", type: boolean, default: false }
+      kernel_name: { description: "kernel name template", required: false, default: "{base}-evokerr" }
+      builder:     { description: "builder shown in Settings", required: false, default: "evokerr@evokeroot" }
+      link:        { description: "link in /proc/version and uname -v", required: false, default: "t.me/evokeroot" }
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.build.outputs.matrix }}
+      count:  ${{ steps.build.outputs.count }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: build
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ONLY: ${{ inputs.only }}
+        run: |
+          # --force ignores state.json, so this always rebuilds what you asked for.
+          # /dev/null as the state file keeps the scheduled job's bookkeeping untouched.
+          python3 scripts/check_upstream.py \
+            --state /dev/null \
+            --roots "${{ inputs.root_solution }}" \
+            --force --print > all.json
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+          rows = json.load(open("all.json"))
+          only = os.environ.get("ONLY", "").strip()
+          if only:
+              rows = [r for r in rows if r["kmi"] == only]
+          print("count=%d" % len(rows))
+          print("matrix=%s" % json.dumps({"include": rows}))
+          PY
+      - run: |
+          echo "${{ steps.build.outputs.count }} build(s) queued"
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.count != '0'
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    uses: ./.github/workflows/gki-build.yml
+    with:
+      android_version: ${{ matrix.android_version }}
+      kernel_version:  ${{ matrix.kernel_version }}
+      sub_level:       ${{ matrix.sub_level }}
+      os_patch_level:  ${{ matrix.os_patch_level }}
+      root_solution:   ${{ matrix.root_solution }}
+      add_susfs:       ${{ inputs.add_susfs }}
+      add_kpm:         ${{ inputs.add_kpm }}
+      kernel_name:     ${{ inputs.kernel_name }}
+      builder:         ${{ inputs.builder }}
+      link:            ${{ inputs.link }}
