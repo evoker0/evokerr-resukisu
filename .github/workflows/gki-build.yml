@@ -134,7 +134,10 @@ jobs:
           if [ "$WANT_SUSFS" = "true" ]; then
             git clone -q https://gitlab.com/simonpunk/susfs4ksu.git \
               -b "gki-${ANDROID_VER}-${KERNEL_VER}" susfs4ksu
-            REVS="$(git -C susfs4ksu rev-list --max-count=60 HEAD)"
+            # Walk the revisions that actually touched this KMI's patch file. A plain
+            # rev-list spends its budget on commits for unrelated files, while the newest
+            # revision KernelSU-Next can build against sits roughly ten months back.
+            REVS="$(git -C susfs4ksu rev-list --max-count=250 HEAD -- "$P")"
 
             # A standalone shallow clone of the driver, only so the compatibility check
             # below can read its sources. setup.sh does the real thing later, inside the
@@ -146,7 +149,41 @@ jobs:
             esac
             [ -n "${{ inputs.ksu_branch }}" ] && DRV_BR="${{ inputs.ksu_branch }}"
             git clone -q --depth=1 -b "$DRV_BR" "$DRV_URL" drvsrc
+
+            # Every kernel-side identifier the driver expects to exist. CMD_SUSFS_* are
+            # defined in susfs_def.h, never in susfs.h, and the DATA_ADB_* names do not
+            # live in a header at all - so a candidate is searched as a whole.
+            grep -rhoE 'CMD_SUSFS_[A-Z0-9_]+|DATA_ADB_[A-Z0-9_]+' drvsrc/kernel \
+              2>/dev/null | sort -u > "$GITHUB_WORKSPACE/drv_syms.txt"
           fi
+
+          # True when the susfs revision currently checked out can satisfy the driver.
+          #
+          # Only KernelSU-Next is gated. ReSukiSU and SukiSU-Ultra carry their own SUSFS
+          # inside the driver, so their sources contain calls in the older style even
+          # while they build fine against the newest headers; gating them rejected every
+          # revision and failed all 31 builds in a run.
+          #
+          # Two mismatches this catches, both of which used to surface 20 minutes into a
+          # compile rather than here:
+          #   * the driver calls susfs_set_uname(struct st_susfs_uname *) while
+          #     susfs >= 2025-11-16 declares void susfs_set_uname(void **)
+          #   * susfs deprecated CMD_SUSFS_HIDE_SUS_MNTS_FOR_ALL_PROCS on 2025-11-20 and
+          #     the DATA_ADB_* names on 2025-11-22, and the driver still uses both
+          susfs_fits() {
+            [ "$ROOT_SOL" = "KernelSU-Next" ] || return 0
+            _S="$GITHUB_WORKSPACE/susfs4ksu"
+            _ALL="$(cat "$_S/kernel_patches/include/linux/susfs_def.h" \
+                        "$_S/kernel_patches/include/linux/susfs.h" \
+                        "$_S/$P" 2>/dev/null)"
+            while read -r _SYM; do
+              case "$_ALL" in *"$_SYM"*) ;; *) return 1 ;; esac
+            done < "$GITHUB_WORKSPACE/drv_syms.txt"
+            if grep -rqs 'susfs_set_uname((struct' "$GITHUB_WORKSPACE/drvsrc/kernel"; then
+              case "$_ALL" in *"void susfs_set_uname(void __user"*) return 1 ;; esac
+            fi
+            return 0
+          }
 
           # Months that carry the same sublevel are interchangeable, and the caller passes
           # them newest first. Naming is by sublevel, so whichever one works produces the
@@ -193,34 +230,7 @@ jobs:
               git -C "$GITHUB_WORKSPACE/susfs4ksu" checkout -q "$C"
               [ -f "$GITHUB_WORKSPACE/susfs4ksu/$P" ] || continue
 
-              # KernelSU-Next only. ReSukiSU and SukiSU-Ultra carry their own SUSFS
-              # implementation inside the driver, so their sources contain calls in the
-              # older style even while they build fine against the newest susfs headers.
-              # Running this check on them rejected every single revision and failed all
-              # 31 builds in a run - the check is about pershoot's fork, which consumes
-              # the kernel-side API rather than shipping its own.
-              #
-              # Two ways that went wrong there, both found 20 minutes into a compile:
-              #   * on 5.10 the driver calls susfs_set_uname(struct st_susfs_uname *)
-              #     while susfs >= 2025-11 declares void susfs_set_uname(void **)
-              #   * on 6.6 the driver uses CMD_SUSFS_ADD_SUS_MAP and
-              #     CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING, which older susfs never defined
-              # A fixed date pin cannot satisfy both, because susfs's gki-android14-6.1
-              # branch runs ahead of gki-android13-5.10.
-              if [ "$ROOT_SOL" = "KernelSU-Next" ]; then
-                HDR="$GITHUB_WORKSPACE/susfs4ksu/kernel_patches/include/linux/susfs.h"
-                [ -f "$HDR" ] || continue
-                BAD=0
-                for CMD in $(grep -rhos 'CMD_SUSFS_[A-Z0-9_]*' \
-                               "$GITHUB_WORKSPACE/drvsrc/kernel" 2>/dev/null | sort -u); do
-                  grep -q "define[[:space:]]\+$CMD\b" "$HDR" || { BAD=1; break; }
-                done
-                [ "$BAD" = 0 ] || continue
-                if grep -rqs 'susfs_set_uname((struct' "$GITHUB_WORKSPACE/drvsrc/kernel" \
-                   && grep -qs 'void susfs_set_uname(void __user' "$HDR"; then
-                  continue  # driver wants the int/typed form, this susfs has the void form
-                fi
-              fi
+              susfs_fits || continue
 
               # Exact first. Fuzz lets patch place a hunk where the context only roughly
               # matches, which on android16-6.12 produced syntactically broken C in
@@ -245,6 +255,9 @@ jobs:
             for C in $REVS; do
               git -C "$GITHUB_WORKSPACE/susfs4ksu" checkout -q "$C"
               [ -f "$GITHUB_WORKSPACE/susfs4ksu/$P" ] || continue
+              # The fuzz pass used to skip this check, so a revision the exact pass had
+              # just rejected was picked up here and reached the compiler anyway.
+              susfs_fits || continue
               if (cd common && patch -p1 -F2 --dry-run --no-backup-if-mismatch \
                     < "$GITHUB_WORKSPACE/susfs4ksu/$P" >/dev/null 2>&1); then
                 D="$(git -C "$GITHUB_WORKSPACE/susfs4ksu" log -1 --format=%cd --date=short)"
