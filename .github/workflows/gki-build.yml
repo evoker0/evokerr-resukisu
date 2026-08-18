@@ -1,7 +1,7 @@
 # .github/workflows/gki-build.yml
 #
 # Builds ONE GKI kernel (one KMI) with the chosen root solution + SUSFS,
-# renames it with your own branding, and uploads an AnyKernel3 zip.
+# rewrites the kernel name it reports, and uploads an AnyKernel3 zip.
 #
 # Callable on its own (workflow_dispatch) or from build-all-gki.yml (workflow_call).
 #
@@ -72,7 +72,7 @@ jobs:
       ROOT_SOL:    ${{ inputs.root_solution }}
 
     steps:
-      - name: Checkout (for scripts/brand_kernel.py)
+      - name: Checkout (for scripts/uname_changer.py)
         uses: actions/checkout@v4
 
       - name: Free up disk space
@@ -481,10 +481,10 @@ jobs:
           done
           echo "Image not found:"; find . -name Image -type f | head -20; exit 1
 
-      - name: Rename the kernel
+      - name: Change uname
         run: |
           set -eux
-          python3 "$GITHUB_WORKSPACE/scripts/brand_kernel.py" \
+          python3 "$GITHUB_WORKSPACE/scripts/uname_changer.py" \
             --image   "$IMAGE" \
             --name    '${{ inputs.kernel_name }}' \
             --builder '${{ inputs.builder }}' \

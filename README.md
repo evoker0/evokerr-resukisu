@@ -83,7 +83,7 @@ for it there is refused rather than silently ignored.
   auto-release.yml     daily upstream check, then build and publish
 scripts/
   check_upstream.py    decides what is stale
-  brand_kernel.py      writes the kernel name into the built Image
+  uname_changer.py     rewrites the name the kernel reports in uname / Settings
 state.json             what was last built, per KMI and flavour
 ```
 

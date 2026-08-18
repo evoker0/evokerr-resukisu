@@ -64,21 +64,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -eu
-          {
-            echo "GKI kernels, one per monthly branch and KMI."
-            echo
-            echo "Pick the file whose kernel version and \`androidXX\` match \`uname -r\` on"
-            echo "your device. A kernel built for a different KMI generation will not boot."
-            echo
-            echo "Flash the AnyKernel3 zip from a recovery or a root manager, or put the"
-            echo "\`Image\` into your own boot image with magiskboot."
-            echo
-            echo "Files land here as each build finishes, so the list grows while the run is"
-            echo "still going. A \`-noSUSFS\` suffix means SUSFS could not be fitted for that"
-            echo "combination and the kernel was built without it."
-          } > notes.md
           gh release create "${{ steps.stamp.outputs.tag }}" \
-            --title "${{ steps.stamp.outputs.tag }}" --notes-file notes.md \
+            --title "ReSukiSU + SUSFS - ${{ steps.stamp.outputs.tag }}" \
+            --notes-file .github/release-notes.md \
             --repo "${{ github.repository }}"
 
       - name: Keep the new state
